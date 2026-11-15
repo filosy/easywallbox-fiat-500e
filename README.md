@@ -1,30 +1,43 @@
 # EasyWallbox Fiat 500e
 
-A lightweight ESP32-based project to address the lack of automatic charge stopping at a user-defined battery state of charge (SoC) when charging a Fiat 500e with an EasyWallbox.
+An ESP32-based project designed to stop a Fiat 500e charging session at a user-selected battery state of charge (SoC), typically 80%, when using an EasyWallbox.
 
-## What it does
+> **Project status:** This repository currently contains documentation only. Firmware, wiring diagrams, supported ESP32 boards, and the exact charging-control method have not yet been added. The details below describe the intended behavior based on the project description.
 
-The project is intended to stop charging when the battery reaches a selected SoC limit—typically 80%. Before charging, the user selects the battery's current SoC; the ESP32 then monitors the charge progression and stops the charging process when the configured limit is reached.
+## The problem
+
+The charging setup does not provide the desired automatic stop at a selected battery percentage. This project aims to provide that behavior with a simple ESP32 and a small amount of code.
+
+## Intended behavior
+
+1. The user selects or enters the battery's current SoC before charging.
+2. A target SoC is selected, usually 80%.
+3. The ESP32 uses those values to determine when the target is reached and stop the charging session.
+
+The exact way the current SoC is entered, how charging progress is determined, and how the ESP32 stops charging depend on the implementation and are not documented yet.
 
 ## Hardware and software
 
-- ESP32 development board
-- EasyWallbox and Fiat 500e
-- Project firmware (see the source code in this repository)
+- An ESP32 development board
+- A Fiat 500e and EasyWallbox
+- Firmware and any required interface components (details to be documented)
 
-## How to use
+## Setup and use
 
-1. Set up the ESP32 and connect it to the charging-control arrangement implemented by this project.
-2. Configure or select the vehicle's current battery SoC.
-3. Set the desired charge limit (usually 80%).
-4. Start charging. The project is designed to stop the charge when the selected limit is reached.
+The project-specific installation and operating instructions are not available in the repository yet. Before using this project, document and verify at least:
 
-> **Note:** Wiring, configuration, and operating details depend on the implementation in the source code. Review the code and verify the setup carefully before connecting or using it with a vehicle or charging equipment.
+- The supported ESP32 board and required software/toolchain
+- How to configure the current SoC and target percentage
+- The connection/interface used to control charging
+- Wiring, power, and enclosure requirements
+- How to test the setup safely before connecting it to charging equipment
 
-## Disclaimer
+Do not infer wiring or connect an ESP32 directly to mains or charging conductors based on this README. Use an appropriately designed and isolated interface, and follow the equipment manufacturers' instructions and applicable electrical-safety requirements.
 
-This is an independent project and is not affiliated with or endorsed by Fiat or EasyWallbox. Use it at your own risk. Incorrect wiring or control of charging equipment can cause damage or create safety hazards. Follow the manufacturers' instructions and applicable electrical-safety requirements.
+## Safety and disclaimer
+
+This is an independent project and is not affiliated with or endorsed by Fiat or EasyWallbox. Charging equipment involves hazardous voltages and currents. Incorrect wiring or control can cause electric shock, fire, injury, or damage to the vehicle or equipment. Use at your own risk and have the installation checked by a qualified professional.
 
 ## License
 
-No license has been specified yet. Until a license is added, the repository's contents are not explicitly licensed for reuse.
+No license has been specified. Until a license is added, the repository's contents are not explicitly licensed for reuse.
