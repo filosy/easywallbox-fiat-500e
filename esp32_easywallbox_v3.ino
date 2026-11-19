@@ -1,15 +1,11 @@
 /*
- * ======================================================================================
- * CONTROLLER FIAT 500e + EASYWALLBOX (eWB07491) — [REV 3.1 - BLE PARING + DPM AD]
- * ======================================================================================
- * RIEPILOGO FUNZIONI (REV 3.1):
- * - Connessione BLE sicura alla easyWallbox (eWB07491) con pairing passkey 01234.
- * - Autenticazione applicativa con $BLE,AUTH,9093.
- * - Polling periodico $DATA,READ,AD per leggere il consumo del sensore DPM.
- * - Pagina 2 aggiornata con stima potenza domestica e totale DPM.
- * - Tensione nominale della stima DPM configurabile in DPM_NOMINAL_VOLTAGE_V.
- * - Ripristino DPM ON dopo timeout e stop automatico all'80%.
- * ======================================================================================
+ * CONTROLLER FIAT 500e + EASYWALLBOX — REV 3.2 WEB
+ * - BLE pairing and application authentication
+ * - Wi-Fi web server without HTTP authentication
+ * - AD telemetry and house/DPM power estimation
+ * - Graphical confirmation of SoC after it is accepted by ESP32
+ * - Native stop command: $CMD,CHARGE,STOP,0
+ * - DPM enable/disable via EEPROM index 178
  */
 
 #include <Arduino.h>
@@ -17,20 +13,20 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <NimBLEDevice.h>
-#include <stdlib.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
-#define FW_REVISION       "REV 3.1"
-#define EWB_NAME          "eWB07491"
-#define EWB_MAC_ADDR      "60:a4:23:7c:af:b1"
-#define EWB_BLE_PIN       "9093"
-#define EWB_PAIRING_CODE  1234UL
+// Replace before uploading. Use a 2.4 GHz Wi-Fi network.
+const char* WIFI_SSID = "NOME_WIFI";
+const char* WIFI_PASS = "PASSWORD_WIFI";
+
+#define FW_REVISION "REV 3.2 WEB"
+#define EWB_MAC_ADDR "60:a4:23:7c:af:b1"
+#define EWB_BLE_PIN "9093"
+#define EWB_PAIRING_CODE 1234UL
 
 static NimBLEUUID serviceUUID("331a36f5-2459-45ea-9d95-6142f0c4b307");
-
-// Wallbox RX: characteristic used by this ESP32 to write commands.
 static NimBLEUUID charWriteUUID("a9da6040-0823-4995-94ec-9ce41ca28833");
-
-// Wallbox TX and status characteristics: notifications from the wallbox.
 static NimBLEUUID charNotifyUUID("a73e9a10-628f-4494-a099-12efaf72258f");
 static NimBLEUUID charStatusUUID("75a9f022-af03-4e41-b4bc-9de90a47d50b");
 
@@ -38,27 +34,26 @@ static NimBLEUUID charStatusUUID("75a9f022-af03-4e41-b4bc-9de90a47d50b");
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
+#define ENC_CLK 32
+#define ENC_DT 33
+#define ENC_SW 25
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-#define ENC_CLK 32
-#define ENC_DT  33
-#define ENC_SW  25
+WebServer server(80);
 
 const float NET_BATTERY_KWH = 37.3f;
 const int TARGET_SOC = 80;
 const float AC_LOSS_FACTOR = 1.12f;
 const float FALLBACK_POWER_KW = 2.05f;
 const float NOMINAL_VOLTAGE_V = 230.0f;
-const float DPM_NOMINAL_VOLTAGE_V = 230.0f;  // da regolare in base alla tensione domestica
+const float DPM_NOMINAL_VOLTAGE_V = 230.0f;
 
 const unsigned long DPM_OFF_DURATION_SEC = 15UL * 60UL;
 const unsigned long OLED_TIMEOUT_MS = 20UL * 60UL * 1000UL;
 const unsigned long LONG_PRESS_MS = 2000UL;
-const unsigned long PAGE1_DURATION_MS = 30000UL;
-const unsigned long PAGE2_DURATION_MS = 10000UL;
 const unsigned long AUTH_DELAY_MS = 8000UL;
 const unsigned long AD_POLL_INTERVAL_MS = 10000UL;
+const unsigned long STOP_CONFIRM_TIMEOUT_MS = 20000UL;
 
 enum SystemState {
   STATE_SELECT_SOC,
@@ -68,7 +63,6 @@ enum SystemState {
 };
 
 SystemState currentState = STATE_SELECT_SOC;
-
 int startSoC = 45;
 int lastCLKState = HIGH;
 
@@ -90,10 +84,16 @@ bool hasHomePowerData = false;
 unsigned long fallbackDurationSec = 0;
 unsigned long elapsedChargingSec = 0;
 unsigned long lastTickMillis = 0;
+unsigned long lastAdPollMillis = 0;
+unsigned long lastReconnectAttempt = 0;
+unsigned long lastWifiAttempt = 0;
 
 bool dpmTemporarilyOff = false;
 unsigned long dpmOffStartMillis = 0;
-bool hourglassAnimFrame = false;
+
+bool nativeStopPending = false;
+bool nativeStopAck = false;
+unsigned long nativeStopRequestedAt = 0;
 
 NimBLEClient* pClient = nullptr;
 NimBLERemoteCharacteristic* pCharWrite = nullptr;
@@ -102,109 +102,115 @@ NimBLERemoteCharacteristic* pCharStatus = nullptr;
 
 bool bleConnected = false;
 bool bleAuthenticated = false;
-unsigned long lastReconnectAttempt = 0;
-unsigned long lastAdPollMillis = 0;
+
 String bleRxBuffer;
+String lastCommand = "Nessuno";
+String lastReply = "In attesa";
+String lastTxResult = "N/D";
 
 bool screenNeedsUpdate = true;
 bool oledIsOn = true;
 unsigned long lastUserActivityMs = 0;
-int activeDisplayPage = 1;
-
-int ticker1X = 128;
-int ticker2X = 128;
-unsigned long lastTickerMillis = 0;
-String currentTicker1Text = "";
-String currentTicker2Text = "";
 
 class WallboxClientCallbacks : public NimBLEClientCallbacks {
 public:
   void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
-    Serial.println("[BLE] Pairing passkey requested; providing 01234.");
+    Serial.println("[BLE] Pairing passkey richiesta; invio 01234.");
     NimBLEDevice::injectPassKey(connInfo, EWB_PAIRING_CODE);
   }
 
   void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
-    Serial.printf("[BLE] Pairing complete; encrypted: %s\n",
+    Serial.printf("[BLE] Pairing completato; encrypted: %s\n",
                   connInfo.isEncrypted() ? "YES" : "NO");
   }
 };
 
 static WallboxClientCallbacks wallboxClientCallbacks;
 
-void wakeUpOledAndResetPage() {
-  lastUserActivityMs = millis();
+const char* stateName() {
+  switch (currentState) {
+    case STATE_SELECT_SOC: return "Selezione SoC";
+    case STATE_WAITING_START: return "In attesa dell'auto";
+    case STATE_CHARGING: return "Ricarica in corso";
+    case STATE_COMPLETED: return "Stop richiesto";
+    default: return "Sconosciuto";
+  }
+}
 
+String jsonEscape(const String& input) {
+  String out;
+  out.reserve(input.length() + 8);
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if ((uint8_t)c >= 0x20) {
+      out += c;
+    }
+  }
+  return out;
+}
+
+void wakeUpOled() {
+  lastUserActivityMs = millis();
   if (!oledIsOn) {
     display.ssd1306_command(SSD1306_DISPLAYON);
     oledIsOn = true;
   }
-
-  if (activeDisplayPage != 1) {
-    activeDisplayPage = 1;
-  }
-
   screenNeedsUpdate = true;
 }
 
-void drawHourglass(int x, int y, bool frame) {
-  display.drawLine(x, y, x + 8, y, SSD1306_WHITE);
-  display.drawLine(x, y + 11, x + 8, y + 11, SSD1306_WHITE);
-  display.drawLine(x + 1, y + 1, x + 4, y + 5, SSD1306_WHITE);
-  display.drawLine(x + 7, y + 1, x + 4, y + 5, SSD1306_WHITE);
-  display.drawLine(x + 4, y + 6, x + 1, y + 10, SSD1306_WHITE);
-  display.drawLine(x + 4, y + 6, x + 7, y + 10, SSD1306_WHITE);
-
-  if (!frame) {
-    display.drawLine(x + 2, y + 2, x + 6, y + 2, SSD1306_WHITE);
-    display.drawLine(x + 3, y + 3, x + 5, y + 3, SSD1306_WHITE);
-    display.drawPixel(x + 4, y + 7, SSD1306_WHITE);
-    display.drawLine(x + 3, y + 10, x + 5, y + 10, SSD1306_WHITE);
-  } else {
-    display.drawPixel(x + 4, y + 4, SSD1306_WHITE);
-    display.drawPixel(x + 4, y + 8, SSD1306_WHITE);
-    display.drawLine(x + 3, y + 9, x + 5, y + 9, SSD1306_WHITE);
-    display.drawLine(x + 2, y + 10, x + 6, y + 10, SSD1306_WHITE);
-  }
-}
-
 void sendBLECommand(const String& cmd) {
+  lastCommand = cmd;
   if (!bleConnected || pCharWrite == nullptr) {
+    lastTxResult = "Non inviato: BLE non connesso";
     Serial.printf("[EWB TX] skipped (not connected): %s\n", cmd.c_str());
     return;
   }
 
   String fullCmd = cmd + "\n";
   bool ok = pCharWrite->writeValue((uint8_t*)fullCmd.c_str(), fullCmd.length(), false);
-
   if (!ok) {
     ok = pCharWrite->writeValue((uint8_t*)fullCmd.c_str(), fullCmd.length(), true);
   }
 
+  lastTxResult = ok
+    ? "Scrittura BLE OK; esecuzione non confermata"
+    : "Scrittura BLE fallita";
   Serial.printf("[EWB TX] %s -> %s\n", cmd.c_str(), ok ? "OK" : "ERR");
 }
 
 unsigned long getDpmRemainingSec() {
   if (!dpmTemporarilyOff) return 0;
-
   unsigned long elapsed = (millis() - dpmOffStartMillis) / 1000UL;
   if (elapsed >= DPM_OFF_DURATION_SEC) return 0;
-
   return DPM_OFF_DURATION_SEC - elapsed;
+}
+
+void setDpmEnabled(bool enabled) {
+  if (!bleConnected || !bleAuthenticated) {
+    lastReply = "DPM non modificato: BLE non autenticato";
+    return;
+  }
+  sendBLECommand(enabled ? "$EEP,WRITE,IDX,178,1" : "$EEP,WRITE,IDX,178,0");
 }
 
 void toggleDpmOff15Min() {
   if (!dpmTemporarilyOff) {
     dpmTemporarilyOff = true;
     dpmOffStartMillis = millis();
-    sendBLECommand("$CMD,DPM,0");
-    Serial.println("DPM OFF enabled for 15 minutes.");
+    setDpmEnabled(false);
+    lastReply = "Richiesto DPM OFF per 15 minuti";
   } else {
     dpmTemporarilyOff = false;
-    sendBLECommand("$CMD,DPM,1");
-    Serial.println("DPM OFF cancelled; restoring DPM ON.");
+    setDpmEnabled(true);
+    lastReply = "Richiesto ripristino DPM ON";
   }
-
   screenNeedsUpdate = true;
 }
 
@@ -222,18 +228,38 @@ String getCsvField(const String& data, int targetIndex) {
       startPos = i + 1;
     }
   }
-
   return "";
 }
 
 bool isUnsignedInteger(const String& value) {
   if (value.length() == 0) return false;
-
   for (int i = 0; i < value.length(); i++) {
     if (!isDigit(value.charAt(i))) return false;
   }
-
   return true;
+}
+
+void requestStop() {
+  if (!bleConnected || !bleAuthenticated) {
+    lastReply = "STOP non inviato: BLE non autenticato";
+    lastTxResult = "Nessuna scrittura";
+    Serial.println("[CHARGE] STOP non inviato: BLE non autenticato.");
+    return;
+  }
+
+  if (dpmTemporarilyOff) {
+    dpmTemporarilyOff = false;
+    setDpmEnabled(true);
+  }
+
+  nativeStopPending = true;
+  nativeStopAck = false;
+  nativeStopRequestedAt = millis();
+
+  sendBLECommand("$CMD,CHARGE,STOP,0");
+  currentState = STATE_COMPLETED;
+  lastReply = "STOP inviato; attendo conferma BLE e telemetria";
+  screenNeedsUpdate = true;
 }
 
 void processWallboxLine(String resp) {
@@ -241,161 +267,103 @@ void processWallboxLine(String resp) {
   if (resp.length() == 0) return;
 
   Serial.println("[EWB RX] " + resp);
+  lastReply = resp;
+
+  if (resp.indexOf("$CMD,CHARGE,STOP,OK") >= 0) {
+    nativeStopAck = true;
+    lastReply = "ACK STOP ricevuto; attendo conferma telemetria";
+    Serial.println("[CHARGE] ACK STOP ricevuto dalla wallbox.");
+  }
 
   if (resp.indexOf("$BLE,AUTH,OK") >= 0) {
     bleAuthenticated = true;
     lastAdPollMillis = millis() - AD_POLL_INTERVAL_MS;
-    Serial.println("[BLE] Application authentication confirmed.");
-    screenNeedsUpdate = true;
+    Serial.println("[BLE] Autenticazione applicativa confermata.");
   }
 
   if (resp.indexOf("$BLE,AUTH,FAIL") >= 0 || resp.indexOf("$ERR,") >= 0) {
     bleAuthenticated = false;
-    Serial.println("[BLE] Wallbox reported an error.");
+    Serial.println("[BLE] La wallbox ha segnalato un errore.");
   }
 
-  /*
-   * Observed reply format:
-   * $DATA,READ,AD,<field0>,...,<field21>
-   *
-   * Absolute CSV indexes:
-   * 7  = charge state
-   * 10 = charging current in tenths of an amp
-   * 11 = charging power in watts
-   * 14 = DPM measured current in tenths of an amp
-   * 22 = session energy in 0.1 kWh
-   */
-  if (resp.startsWith("$DATA,READ,AD,")) {
-    String stateField = getCsvField(resp, 7);
-    String carCurrentField = getCsvField(resp, 10);
-    String carPowerField = getCsvField(resp, 11);
-    String dpmCurrentField = getCsvField(resp, 14);
-    String energyField = getCsvField(resp, 22);
+  if (!resp.startsWith("$DATA,READ,AD,")) return;
 
-    int stateVal = stateField.toInt();
+  String stateField = getCsvField(resp, 7);
+  String carCurrentField = getCsvField(resp, 10);
+  String carPowerField = getCsvField(resp, 11);
+  String dpmCurrentField = getCsvField(resp, 14);
+  String energyField = getCsvField(resp, 22);
 
-    if (isUnsignedInteger(carCurrentField)) {
-      float currentA = carCurrentField.toFloat() / 10.0f;
-      if (currentA >= 0.0f && currentA < 40.0f) {
-        liveCurrentA = currentA;
-      }
-    }
+  int stateVal = stateField.toInt();
 
-    if (isUnsignedInteger(carPowerField)) {
-      float powerW = carPowerField.toFloat();
-      if (powerW >= 0.0f) {
-        wallboxPowerKw = powerW / 1000.0f;
-      }
-    } else {
-      wallboxPowerKw = liveCurrentA * NOMINAL_VOLTAGE_V / 1000.0f;
-    }
-
-    float sessionKwh = -1.0f;
-    if (isUnsignedInteger(energyField)) {
-      sessionKwh = energyField.toFloat() / 10.0f;
-    }
-
-    if (stateVal == 8) {
-      if (currentState == STATE_WAITING_START) {
-        currentState = STATE_CHARGING;
-        lastTickMillis = millis();
-
-        sessionStartKwh = sessionKwh;
-        deliveredKwh = 0.0f;
-        hasLiveEnergyData = sessionKwh >= 0.0f;
-      } else if (currentState == STATE_CHARGING &&
-                 sessionKwh >= 0.0f &&
-                 sessionStartKwh >= 0.0f) {
-        deliveredKwh = sessionKwh - sessionStartKwh;
-        if (deliveredKwh < 0.0f) deliveredKwh = sessionKwh;
-        hasLiveEnergyData = true;
-      }
-
-      screenNeedsUpdate = true;
-    } else if (currentState == STATE_CHARGING && liveCurrentA < 0.5f) {
-      wallboxPowerKw = 0.0f;
-    }
-
-    if (isUnsignedInteger(dpmCurrentField)) {
-      float dpmCurrentDa = dpmCurrentField.toFloat();
-
-      // Formula con tensione nominale configurabile.
-      dpmTotalPowerKw = (dpmCurrentDa * DPM_NOMINAL_VOLTAGE_V) / 10000.0f;
-
-      // Il sensore DPM misura il totale; stimo la casa sottraendo la potenza carica dell'auto.
-      float carPowerKw = (stateVal == 8) ? wallboxPowerKw : 0.0f;
-      homePowerKw = dpmTotalPowerKw - carPowerKw;
-      if (homePowerKw < 0.0f) homePowerKw = 0.0f;
-
-      hasHomePowerData = true;
-
-      Serial.printf("[DPM AD] dpm=%s dA, total=%.2f kW, house-estimate=%.2f kW\n",
-                    dpmCurrentField.c_str(),
-                    dpmTotalPowerKw,
-                    homePowerKw);
-    }
-
-    screenNeedsUpdate = true;
-  }
-
-  // Legacy support for $STS if the wallbox sends it.
-  if (resp.startsWith("$STS,")) {
-    String fieldState = getCsvField(resp, 1);
-    String fieldCurr = getCsvField(resp, 2);
-    String fieldPowW = getCsvField(resp, 3);
-    String fieldWh = getCsvField(resp, 4);
-
-    if (fieldState.length() > 0 && fieldCurr.length() > 0) {
-      int stateVal = fieldState.toInt();
-      float currA = fieldCurr.toFloat() / 10.0f;
-
-      if (currA >= 0.0f && currA < 40.0f) {
-        liveCurrentA = currA;
-
-        if (fieldPowW.length() > 0 && fieldPowW.toFloat() > 0.0f) {
-          wallboxPowerKw = fieldPowW.toFloat() / 1000.0f;
-        } else {
-          wallboxPowerKw = liveCurrentA * NOMINAL_VOLTAGE_V / 1000.0f;
-        }
-      }
-
-      if ((stateVal == 8 || liveCurrentA > 3.0f) &&
-          currentState == STATE_WAITING_START) {
-        currentState = STATE_CHARGING;
-        lastTickMillis = millis();
-        screenNeedsUpdate = true;
-      } else if (currentState == STATE_CHARGING && liveCurrentA < 0.5f) {
-        wallboxPowerKw = 0.0f;
-      }
-    }
-
-    if (fieldWh.length() > 0) {
-      float rawWh = fieldWh.toFloat();
-      if (rawWh >= 0.0f) {
-        float currentKwh = rawWh / 1000.0f;
-
-        if (sessionStartKwh < 0.0f) {
-          sessionStartKwh = currentKwh;
-        }
-
-        deliveredKwh = (currentKwh >= sessionStartKwh)
-          ? currentKwh - sessionStartKwh
-          : currentKwh;
-
-        hasLiveEnergyData = true;
-        screenNeedsUpdate = true;
-      }
+  if (isUnsignedInteger(carCurrentField)) {
+    float currentA = carCurrentField.toFloat() / 10.0f;
+    if (currentA >= 0.0f && currentA < 40.0f) {
+      liveCurrentA = currentA;
     }
   }
+
+  if (isUnsignedInteger(carPowerField)) {
+    wallboxPowerKw = carPowerField.toFloat() / 1000.0f;
+  } else {
+    wallboxPowerKw = liveCurrentA * NOMINAL_VOLTAGE_V / 1000.0f;
+  }
+
+  if (stateVal != 8 && currentState == STATE_CHARGING && liveCurrentA < 0.5f) {
+    wallboxPowerKw = 0.0f;
+  }
+
+  float sessionKwh = -1.0f;
+  if (isUnsignedInteger(energyField)) {
+    sessionKwh = energyField.toFloat() / 10.0f;
+  }
+
+  if (stateVal == 8) {
+    if (currentState == STATE_WAITING_START) {
+      currentState = STATE_CHARGING;
+      lastTickMillis = millis();
+      sessionStartKwh = sessionKwh;
+      deliveredKwh = 0.0f;
+      hasLiveEnergyData = sessionKwh >= 0.0f;
+    } else if (currentState == STATE_CHARGING && sessionKwh >= 0.0f && sessionStartKwh >= 0.0f) {
+      deliveredKwh = sessionKwh - sessionStartKwh;
+      if (deliveredKwh < 0.0f) deliveredKwh = sessionKwh;
+      hasLiveEnergyData = true;
+    }
+  }
+
+  if (nativeStopPending && stateVal != 8 && liveCurrentA < 0.5f) {
+    nativeStopPending = false;
+    lastReply = nativeStopAck
+      ? "STOP confermato: ACK ricevuto e corrente a zero"
+      : "STOP confermato dalla telemetria: corrente a zero";
+    Serial.printf("[CHARGE] STOP CONFERMATO da AD: stato=%d, corrente=%.1f A\n",
+                  stateVal, liveCurrentA);
+  }
+
+  if (isUnsignedInteger(dpmCurrentField)) {
+    float dpmCurrentDa = dpmCurrentField.toFloat();
+    dpmTotalPowerKw = dpmCurrentDa * DPM_NOMINAL_VOLTAGE_V / 10000.0f;
+
+    float carPowerKw = (stateVal == 8) ? wallboxPowerKw : 0.0f;
+    homePowerKw = dpmTotalPowerKw - carPowerKw;
+    if (homePowerKw < 0.0f) homePowerKw = 0.0f;
+    hasHomePowerData = true;
+
+    Serial.printf("[DPM AD] dpm=%s dA, total=%.2f kW, car=%.2f kW, house-estimate=%.2f kW\n",
+                  dpmCurrentField.c_str(), dpmTotalPowerKw, wallboxPowerKw, homePowerKw);
+  }
+
+  screenNeedsUpdate = true;
 }
 
-void notifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data, size_t length, bool isNotify) {
+void notifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data,
+                    size_t length, bool isNotify) {
   (void)characteristic;
   (void)isNotify;
 
   for (size_t i = 0; i < length; i++) {
     char c = (char)data[i];
-
     if (c == '\r') continue;
 
     if (c == '\n') {
@@ -404,29 +372,28 @@ void notifyCallback(NimBLERemoteCharacteristic* characteristic, uint8_t* data, s
     } else if (bleRxBuffer.length() < 512) {
       bleRxBuffer += c;
     } else {
-      Serial.println("[BLE] Notification buffer overflow; clearing it.");
+      Serial.println("[BLE] Buffer notifiche pieno; azzerato.");
       bleRxBuffer = "";
     }
   }
 }
 
 bool connectToWallbox() {
-  Serial.println("Scanning BLE for eWB07491...");
+  Serial.println("[BLE] Scansione EasyWallbox...");
 
   NimBLEScan* pScan = NimBLEDevice::getScan();
   pScan->setActiveScan(true);
   pScan->setInterval(100);
   pScan->setWindow(99);
 
-  NimBLEScanResults results = pScan->getResults(4000, false);
+  NimBLEScanResults results = pScan->getResults(2000, false);
   const NimBLEAdvertisedDevice* targetDevice = nullptr;
 
   for (int i = 0; i < results.getCount(); i++) {
     const NimBLEAdvertisedDevice* dev = results.getDevice(i);
-    String devAddr = String(dev->getAddress().toString().c_str());
-    devAddr.toLowerCase();
-
-    if (devAddr == EWB_MAC_ADDR) {
+    String address = String(dev->getAddress().toString().c_str());
+    address.toLowerCase();
+    if (address == EWB_MAC_ADDR) {
       targetDevice = dev;
       break;
     }
@@ -434,272 +401,288 @@ bool connectToWallbox() {
 
   if (targetDevice == nullptr) {
     pScan->clearResults();
-    Serial.println("[BLE] Wallbox not found.");
+    Serial.println("[BLE] Wallbox non trovata.");
     return false;
   }
 
-  if (pClient == nullptr) {
-    pClient = NimBLEDevice::createClient();
-  }
-
+  if (pClient == nullptr) pClient = NimBLEDevice::createClient();
   pClient->setClientCallbacks(&wallboxClientCallbacks, false);
 
   if (!pClient->connect(targetDevice)) {
     pScan->clearResults();
     bleConnected = false;
     bleAuthenticated = false;
-    Serial.println("[BLE] Connection failed.");
+    Serial.println("[BLE] Connessione fallita.");
     return false;
   }
 
   pScan->clearResults();
-
-  Serial.println("[BLE] Connected; starting secure pairing...");
+  Serial.println("[BLE] Connesso; pairing sicuro...");
 
   if (!pClient->secureConnection()) {
-    Serial.printf("[BLE] secureConnection failed; NimBLE error=%d\n", pClient->getLastError());
+    Serial.printf("[BLE] secureConnection fallita, errore=%d\n", pClient->getLastError());
     pClient->disconnect();
     bleConnected = false;
     bleAuthenticated = false;
     return false;
   }
 
-  Serial.println("[BLE] Secure pairing completed.");
-
-  NimBLERemoteService* pService = pClient->getService(serviceUUID);
-  if (pService == nullptr) {
-    Serial.println("[BLE] EasyWallbox service not found.");
+  NimBLERemoteService* service = pClient->getService(serviceUUID);
+  if (service == nullptr) {
+    Serial.println("[BLE] Servizio EasyWallbox non trovato.");
     pClient->disconnect();
     bleConnected = false;
     return false;
   }
 
-  pCharWrite = pService->getCharacteristic(charWriteUUID);
-  pCharNotify = pService->getCharacteristic(charNotifyUUID);
-  pCharStatus = pService->getCharacteristic(charStatusUUID);
+  pCharWrite = service->getCharacteristic(charWriteUUID);
+  pCharNotify = service->getCharacteristic(charNotifyUUID);
+  pCharStatus = service->getCharacteristic(charStatusUUID);
 
   if (pCharWrite == nullptr) {
-    Serial.println("[BLE] Command-write characteristic not found.");
+    Serial.println("[BLE] Caratteristica scrittura non trovata.");
     pClient->disconnect();
     bleConnected = false;
     return false;
   }
 
   if (pCharNotify != nullptr && pCharNotify->canNotify()) {
-    bool subscribed = pCharNotify->subscribe(true, notifyCallback, true);
-    Serial.printf("[BLE] Main notification subscription: %s\n", subscribed ? "OK" : "FAILED");
-  } else {
-    Serial.println("[BLE] Main notification characteristic unavailable.");
+    pCharNotify->subscribe(true, notifyCallback, true);
   }
-
   if (pCharStatus != nullptr && pCharStatus->canNotify()) {
-    bool subscribed = pCharStatus->subscribe(true, notifyCallback, true);
-    Serial.printf("[BLE] Status notification subscription: %s\n", subscribed ? "OK" : "FAILED");
-  } else {
-    Serial.println("[BLE] Status notification characteristic unavailable.");
+    pCharStatus->subscribe(true, notifyCallback, true);
   }
 
   bleConnected = true;
   bleAuthenticated = false;
   bleRxBuffer = "";
 
-  Serial.println("[BLE] Waiting 8 seconds before application AUTH...");
-  delay(AUTH_DELAY_MS);
+  Serial.println("[BLE] Attendo 8 secondi prima dell'AUTH...");
+  unsigned long authWaitStart = millis();
+  while (millis() - authWaitStart < AUTH_DELAY_MS) {
+    server.handleClient();
+    delay(5);
+  }
 
   if (!pClient->isConnected()) {
-    Serial.println("[BLE] Connection lost before application AUTH.");
     bleConnected = false;
+    Serial.println("[BLE] Connessione persa prima dell'AUTH.");
     return false;
   }
 
-  Serial.println("[BLE] Sending application PIN.");
   sendBLECommand(String("$BLE,AUTH,") + EWB_BLE_PIN);
   return true;
 }
 
-String getDpmStatusPrefix() {
-  return dpmTemporarilyOff ? "DPM: OFF (15m) | " : "DPM: ON | ";
+void startSession(int soc) {
+  if (soc < 5 || soc > 79 || currentState != STATE_SELECT_SOC) return;
+
+  startSoC = soc;
+  float netKwh = ((TARGET_SOC - startSoC) / 100.0f) * NET_BATTERY_KWH;
+  targetGrossKwh = netKwh * AC_LOSS_FACTOR;
+  fallbackDurationSec = (unsigned long)((netKwh / FALLBACK_POWER_KW) * 3600.0f);
+
+  elapsedChargingSec = 0;
+  deliveredKwh = 0.0f;
+  sessionStartKwh = -1.0f;
+  hasLiveEnergyData = false;
+  lastTickMillis = millis();
+  nativeStopPending = false;
+  nativeStopAck = false;
+  currentState = STATE_WAITING_START;
+
+  lastReply = "SoC ricevuto; sessione armata, in attesa dell'auto";
+  Serial.printf("[SESSION] SoC iniziale accettato: %d%%\n", startSoC);
+  screenNeedsUpdate = true;
 }
 
-String getTicker1Message() {
-  String prefix = getDpmStatusPrefix();
-
-  if (currentState == STATE_SELECT_SOC) {
-    float netNeeded = ((TARGET_SOC - startSoC) / 100.0f) * NET_BATTERY_KWH;
-    if (netNeeded < 0.0f) netNeeded = 0.0f;
-
-    float grossNeeded = netNeeded * AC_LOSS_FACTOR;
-    return prefix + "Target 80%: +" + String(grossNeeded, 1) + " kWh gross";
-  }
-
-  if (currentState == STATE_WAITING_START || currentState == STATE_CHARGING) {
-    int estSoc = startSoC + (int)((deliveredKwh / AC_LOSS_FACTOR / NET_BATTERY_KWH) * 100.0f);
-    estSoc = constrain(estSoc, startSoC, TARGET_SOC);
-    return prefix + "Estimated battery: " + String(estSoc) + "% -> 80%";
-  }
-
-  return prefix + "Energy delivered: " + String(deliveredKwh, 2) + " kWh";
+void handleRoot() {
+  static const char page[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="it"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EasyWallbox</title>
+<style>
+:root{color-scheme:dark}body{font-family:system-ui,Arial;background:#111827;color:#e5e7eb;margin:0;padding:16px;max-width:760px;margin:auto}.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px}.stat{background:#111827;border-radius:9px;padding:12px}.label{font-size:13px;color:#9ca3af}.value{font-size:21px;font-weight:700;margin-top:5px}button{border:0;border-radius:8px;padding:12px 14px;color:white;font-size:15px;background:#2563eb;margin:4px}button:disabled{opacity:.55}.stop{background:#dc2626}.warn{background:#b45309}.secondary{background:#4b5563}input[type=range]{width:100%}.soc-status{margin:10px 4px;padding:10px 12px;border-radius:8px;background:#374151;font-weight:600}.soc-status.pending{background:#92400e}.soc-status.ok{background:#166534}.soc-status.error{background:#991b1b}.note{font-size:13px;color:#fbbf24}
+</style></head><body>
+<h2>EasyWallbox · monitor locale</h2>
+<div class="card">
+<div class="label">SoC iniziale selezionato: <b id="socLabel">45%</b> · target: 80%</div>
+<input id="soc" type="range" min="5" max="79" value="45">
+<div id="socStatus" class="soc-status">Seleziona il SoC iniziale</div>
+<button id="start">Imposta SoC / arma sessione</button>
+<button id="stop" class="stop">Richiedi STOP</button>
+<button id="dpmOn" class="secondary">DPM ON</button>
+<button id="dpmOff" class="warn">DPM OFF 15 min</button>
+<p class="note">La conferma SoC significa che l'ESP32 ha armato la sessione. Verifica sempre l'arresto reale sulla wallbox.</p>
+</div>
+<div class="card grid">
+<div class="stat"><div class="label">Stato sessione</div><div class="value" id="state">--</div></div>
+<div class="stat"><div class="label">BLE</div><div class="value" id="ble">--</div></div>
+<div class="stat"><div class="label">Wi-Fi / IP</div><div class="value" id="wifi">--</div></div>
+<div class="stat"><div class="label">DPM</div><div class="value" id="dpm">--</div></div>
+</div>
+<div class="card"><h3>Telemetria</h3><div class="grid">
+<div class="stat"><div class="label">Corrente auto</div><div class="value" id="amps">-- A</div></div>
+<div class="stat"><div class="label">Potenza auto</div><div class="value" id="car">-- kW</div></div>
+<div class="stat"><div class="label">Casa stimata</div><div class="value" id="home">-- kW</div></div>
+<div class="stat"><div class="label">Totale DPM</div><div class="value" id="total">-- kW</div></div>
+<div class="stat"><div class="label">Energia erogata</div><div class="value" id="energy">-- kWh</div></div>
+<div class="stat"><div class="label">Target</div><div class="value" id="target">-- kWh</div></div>
+<div class="stat"><div class="label">Rimanente</div><div class="value" id="remaining">-- kWh</div></div>
+</div></div>
+<div class="card"><div class="label">Ultimo comando / esito scrittura</div><div id="command">--</div><div class="label" style="margin-top:10px">Ultima risposta wallbox</div><div id="reply">--</div></div>
+<script>
+const slider=document.getElementById('soc');const socStatus=document.getElementById('socStatus');const startButton=document.getElementById('start');let socModificato=false;
+slider.addEventListener('input',()=>{socModificato=true;document.getElementById('socLabel').textContent=slider.value+'%';socStatus.className='soc-status';socStatus.textContent='SoC selezionato: '+slider.value+'%. Premi “Imposta SoC” per confermare.'});
+async function control(action){const selectedSoc=slider.value;const body=new URLSearchParams({action,soc:selectedSoc});if(action==='start'){socStatus.className='soc-status pending';socStatus.textContent='Invio SoC '+selectedSoc+'%…';startButton.disabled=true}try{const r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body,cache:'no-store'});let d={};try{d=await r.json()}catch(e){}if(!r.ok||!d.ok){if(action==='start'){socStatus.className='soc-status error';socStatus.textContent=d.error||'ESP32 non ha accettato il SoC'}else alert(d.error||('Comando non accettato: '+r.status));return}if(action==='start'){socModificato=false;slider.value=d.soc;document.getElementById('socLabel').textContent=d.soc+'%';socStatus.className='soc-status ok';socStatus.textContent='✓ SoC '+d.soc+'% ricevuto. Sessione armata, in attesa dell’auto.'}await refresh()}catch(e){if(action==='start'){socStatus.className='soc-status error';socStatus.textContent='Errore di comunicazione: il SoC non è stato confermato.'}else alert('Errore di rete: '+e)}finally{startButton.disabled=false}}
+document.getElementById('start').onclick=()=>control('start');document.getElementById('stop').onclick=()=>control('stop');document.getElementById('dpmOn').onclick=()=>control('dpmOn');document.getElementById('dpmOff').onclick=()=>control('dpmOff');
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();document.getElementById('state').textContent=d.state;document.getElementById('ble').textContent=d.ble;document.getElementById('wifi').textContent=d.wifi;document.getElementById('dpm').textContent=d.dpm;document.getElementById('amps').textContent=d.currentA+' A';document.getElementById('car').textContent=d.carKw+' kW';document.getElementById('home').textContent=d.homeValid?d.homeKw+' kW':'N/D';document.getElementById('total').textContent=d.homeValid?d.totalKw+' kW':'N/D';document.getElementById('energy').textContent=d.delivered+' kWh';document.getElementById('target').textContent=d.target+' kWh';document.getElementById('remaining').textContent=d.remaining+' kWh';document.getElementById('command').textContent=d.command+' — '+d.tx;document.getElementById('reply').textContent=d.reply;if(!socModificato){slider.value=d.soc;document.getElementById('socLabel').textContent=d.soc+'%'}}catch(e){}}
+setInterval(refresh,3000);refresh();
+</script></body></html>
+)HTML";
+  server.send_P(200, "text/html; charset=utf-8", page);
 }
 
-String getTicker2Message() {
-  if (currentState == STATE_SELECT_SOC) {
-    return "Rotate=SoC | Click=Start | Hold 2s=DPM OFF 15m";
+void handleStatus() {
+  float remaining = targetGrossKwh - deliveredKwh;
+  if (remaining < 0.0f) remaining = 0.0f;
+
+  String json = "{";
+  json += "\"state\":\"" + String(stateName()) + "\",";
+  json += "\"ble\":\"" + String(bleConnected ? (bleAuthenticated ? "Connesso" : "Connesso, non autenticato") : "Disconnesso") + "\",";
+  json += "\"wifi\":\"" + String(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "Disconnesso") + "\",";
+  json += "\"soc\":" + String(startSoC) + ",";
+  json += "\"dpm\":\"" + String(dpmTemporarilyOff ? "OFF temporaneo" : "ON") + "\",";
+  json += "\"currentA\":" + String(liveCurrentA, 1) + ",";
+  json += "\"carKw\":" + String(wallboxPowerKw, 2) + ",";
+  json += "\"homeKw\":" + String(homePowerKw, 2) + ",";
+  json += "\"totalKw\":" + String(dpmTotalPowerKw, 2) + ",";
+  json += "\"homeValid\":" + String(hasHomePowerData ? "true" : "false") + ",";
+  json += "\"delivered\":" + String(deliveredKwh, 1) + ",";
+  json += "\"target\":" + String(targetGrossKwh, 1) + ",";
+  json += "\"remaining\":" + String(remaining, 1) + ",";
+  json += "\"stopPending\":" + String(nativeStopPending ? "true" : "false") + ",";
+  json += "\"stopAck\":" + String(nativeStopAck ? "true" : "false") + ",";
+  json += "\"command\":\"" + jsonEscape(lastCommand) + "\",";
+  json += "\"tx\":\"" + jsonEscape(lastTxResult) + "\",";
+  json += "\"reply\":\"" + jsonEscape(lastReply) + "\"";
+  json += "}";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleControl() {
+  String action = server.arg("action");
+
+  if (action == "start") {
+    if (currentState != STATE_SELECT_SOC) {
+      server.send(409, "application/json", "{\"ok\":false,\"error\":\"Sessione già avviata\"}");
+      return;
+    }
+
+    int soc = server.arg("soc").toInt();
+    if (soc < 5 || soc > 79) {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"SoC fuori intervallo\"}");
+      return;
+    }
+
+    startSession(soc);
+    String response = "{\"ok\":true,\"soc\":" + String(startSoC) + ",\"message\":\"SoC ricevuto; sessione armata\"}";
+    server.send(200, "application/json", response);
+    return;
   }
 
-  if (currentState == STATE_WAITING_START || currentState == STATE_CHARGING) {
-    return "Click=STOP charge | Hold 2s=DPM OFF/ON";
+  if (!bleConnected || !bleAuthenticated) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"Wallbox BLE non autenticata\"}");
+    return;
   }
 
-  return "Charge complete! Click for new session";
+  if (action == "stop") {
+    requestStop();
+  } else if (action == "dpmOff") {
+    dpmTemporarilyOff = true;
+    dpmOffStartMillis = millis();
+    setDpmEnabled(false);
+    lastReply = "Richiesto DPM OFF per 15 minuti";
+  } else if (action == "dpmOn") {
+    dpmTemporarilyOff = false;
+    setDpmEnabled(true);
+    lastReply = "Richiesto DPM ON";
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Azione sconosciuta\"}");
+    return;
+  }
+
+  screenNeedsUpdate = true;
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void drawPage1() {
   display.setCursor(0, 0);
-
-  if (bleConnected) {
-    display.print(dpmTemporarilyOff ? "EWB:OK | DPM:OFF" : "EWB:OK | DPM:ON");
-  } else {
-    display.print(FW_REVISION);
-    display.print(dpmTemporarilyOff ? " | DPM:OFF" : " | DPM:ON");
-  }
-
+  display.print(bleConnected ? "EWB:OK " : "EWB:-- ");
+  display.print(dpmTemporarilyOff ? "DPM:OFF" : "DPM:ON");
   display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
 
   if (currentState == STATE_SELECT_SOC) {
-    display.setCursor(0, 11);
-    display.print("BATTERY CURRENT:");
+    display.setCursor(0, 14);
+    display.print("SoC iniziale:");
     display.setTextSize(3);
-    display.setCursor(6, 20);
+    display.setCursor(8, 26);
     display.printf("%d%%", startSoC);
-
-    if (dpmTemporarilyOff) {
-      unsigned long dpmRem = getDpmRemainingSec();
-      drawHourglass(104, 13, hourglassAnimFrame);
-      display.setTextSize(1);
-      display.setCursor(95, 28);
-      display.printf("%02lu:%02lu", dpmRem / 60, dpmRem % 60);
-    }
-  } else if (currentState == STATE_WAITING_START || currentState == STATE_CHARGING) {
-    if (currentState == STATE_WAITING_START) {
-      if (dpmTemporarilyOff) {
-        unsigned long dpmRem = getDpmRemainingSec();
-        drawHourglass(0, 11, hourglassAnimFrame);
-        display.setCursor(14, 13);
-        display.printf("DPM ON IN %02lu:%02lu", dpmRem / 60, dpmRem % 60);
-      } else {
-        display.setCursor(0, 13);
-        display.print("WAITING FOR AUTO TIMER...");
-      }
-    } else {
-      display.setCursor(0, 13);
-      display.printf("CHARGE:%.1fA DPM:%s", liveCurrentA, dpmTemporarilyOff ? "OFF" : "ON");
-    }
-
+  } else if (currentState == STATE_WAITING_START) {
+    display.setCursor(0, 14);
+    display.print("IN ATTESA AUTO");
     display.setTextSize(2);
-    display.setCursor(4, 25);
+    display.setCursor(2, 28);
     display.printf("%.1f/%.1fkWh", deliveredKwh, targetGrossKwh);
-  } else if (currentState == STATE_COMPLETED) {
+  } else if (currentState == STATE_CHARGING) {
+    display.setCursor(0, 14);
+    display.printf("RICARICA %.1fA", liveCurrentA);
     display.setTextSize(2);
-    display.setCursor(6, 18);
-    display.print("STOP 80%!");
-  }
-
-  String msg1 = getTicker1Message();
-  if (msg1 != currentTicker1Text) {
-    currentTicker1Text = msg1;
-    ticker1X = 128;
+    display.setCursor(2, 28);
+    display.printf("%.1f/%.1fkWh", deliveredKwh, targetGrossKwh);
+  } else {
+    display.setTextSize(2);
+    display.setCursor(5, 24);
+    display.print("STOP RICHIESTO");
   }
 
   display.setTextSize(1);
-  display.setCursor(ticker1X, 44);
-  display.print(currentTicker1Text);
-  display.drawLine(0, 53, 127, 53, SSD1306_WHITE);
-
-  String msg2 = getTicker2Message();
-  if (msg2 != currentTicker2Text) {
-    currentTicker2Text = msg2;
-    ticker2X = 128;
-  }
-
-  display.setCursor(ticker2X, 55);
-  display.print(currentTicker2Text);
+  display.setCursor(0, 56);
+  display.print(nativeStopPending ? "Verifica arresto..." : "Web / BLE attivo");
 }
 
 void drawPage2() {
-  bool isDpmOn = !dpmTemporarilyOff;
-  bool isCharging = currentState == STATE_CHARGING;
-
   display.setCursor(0, 0);
-  display.printf("CHARGE INFO | DPM:%s", isDpmOn ? "ON" : "OFF");
+  display.printf("TELEMETRIA | DPM:%s", dpmTemporarilyOff ? "OFF" : "ON");
   display.drawLine(0, 9, 127, 9, SSD1306_WHITE);
 
-  display.setCursor(0, 12);
-  if (isDpmOn && hasHomePowerData) {
-    display.printf("House est.: %.2f kW", homePowerKw);
-  } else if (isDpmOn) {
-    display.print("House est.: --.-- kW");
-  } else {
-    display.print("House est.: N/A (DPM OFF)");
-  }
+  display.setCursor(0, 13);
+  if (hasHomePowerData) display.printf("Casa stim.: %.2f kW", homePowerKw);
+  else display.print("Casa stim.: N/D");
 
-  float activeEwbKw = 0.0f;
-  if (isCharging) {
-    activeEwbKw = wallboxPowerKw > 0.1f ? wallboxPowerKw : FALLBACK_POWER_KW * AC_LOSS_FACTOR;
-  }
+  display.setCursor(0, 24);
+  display.printf("Auto: %.2f kW", wallboxPowerKw);
 
-  display.setCursor(0, 22);
-  if (isCharging) {
-    display.printf("EWB:     %.2f kW", activeEwbKw);
-  } else {
-    display.print("EWB:     0.00 kW (Standby)");
-  }
+  display.setCursor(0, 35);
+  if (hasHomePowerData) display.printf("Totale: %.2f kW", dpmTotalPowerKw);
+  else display.print("Totale: N/D");
 
-  display.setCursor(0, 32);
-  if (isDpmOn && hasHomePowerData) {
-    display.printf("DPM total: %.2f kW", dpmTotalPowerKw);
-  } else {
-    display.printf("DPM total: N/A");
-  }
-
-  display.drawLine(0, 41, 127, 41, SSD1306_WHITE);
-
-  float plannedGross = currentState == STATE_SELECT_SOC
-    ? ((TARGET_SOC - startSoC) / 100.0f) * NET_BATTERY_KWH * AC_LOSS_FACTOR
-    : targetGrossKwh;
-
-  if (plannedGross < 0.0f) plannedGross = 0.0f;
-
-  float remainingKwh = plannedGross - deliveredKwh;
-  if (remainingKwh < 0.0f) remainingKwh = 0.0f;
-
-  display.setCursor(0, 44);
-  display.printf("In:%.1fkWh | Rem:%.1fkWh", deliveredKwh, remainingKwh);
-
-  float activeKwForEta = activeEwbKw > 0.5f ? activeEwbKw : FALLBACK_POWER_KW * AC_LOSS_FACTOR;
-  unsigned long remMinutes = (unsigned long)((remainingKwh / activeKwForEta) * 60.0f);
-
-  display.setCursor(0, 55);
-  if (currentState == STATE_COMPLETED || remainingKwh <= 0.05f) {
-    display.print("Time left: 0h 00m (OK)");
-  } else {
-    display.printf("Time left: %luh %02lum", remMinutes / 60, remMinutes % 60);
-  }
+  display.setCursor(0, 48);
+  display.printf("Energia: %.1f/%.1f kWh", deliveredKwh, targetGrossKwh);
 }
 
 void updateDisplay() {
   if (!oledIsOn) return;
-
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setTextWrap(false);
 
-  if (activeDisplayPage == 1) {
-    drawPage1();
-  } else {
-    drawPage2();
-  }
-
+  if (currentState == STATE_SELECT_SOC) drawPage1();
+  else drawPage1();
   display.display();
   screenNeedsUpdate = false;
 }
@@ -707,8 +690,7 @@ void updateDisplay() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-
-  Serial.println("Starting Fiat 500e + EasyWallbox controller - " + String(FW_REVISION));
+  Serial.println("Avvio controller Fiat 500e + EasyWallbox - " FW_REVISION);
 
   pinMode(ENC_CLK, INPUT_PULLUP);
   pinMode(ENC_DT, INPUT_PULLUP);
@@ -716,9 +698,8 @@ void setup() {
   lastCLKState = digitalRead(ENC_CLK);
 
   Wire.begin(21, 22);
-
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    Serial.println("SSD1306 OLED error.");
+    Serial.println("[OLED] Errore inizializzazione.");
   }
 
   display.clearDisplay();
@@ -730,119 +711,99 @@ void setup() {
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_ONLY);
 
   lastUserActivityMs = millis();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  lastWifiAttempt = millis();
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000UL) {
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[WiFi] Non connesso; verrà ritentato.");
+  }
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/control", HTTP_POST, handleControl);
+  server.begin();
+  Serial.println("[WEB] Server avviato sulla porta 80.");
+
   updateDisplay();
 }
 
 void loop() {
   unsigned long now = millis();
+  server.handleClient();
+
+  if (nativeStopPending && now - nativeStopRequestedAt > STOP_CONFIRM_TIMEOUT_MS) {
+    nativeStopPending = false;
+    lastReply = nativeStopAck
+      ? "ACK STOP ricevuto, ma manca conferma AD: controlla la wallbox"
+      : "STOP non confermato: controlla wallbox e log BLE";
+    Serial.println("[CHARGE] Timeout: stop non confermato dalla telemetria.");
+  }
+
+  if (WiFi.status() != WL_CONNECTED && now - lastWifiAttempt >= 10000UL) {
+    lastWifiAttempt = now;
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
 
   if (oledIsOn && now - lastUserActivityMs > OLED_TIMEOUT_MS) {
     display.ssd1306_command(SSD1306_DISPLAYOFF);
     oledIsOn = false;
   }
 
-  if (oledIsOn) {
-    unsigned long idleTime = now - lastUserActivityMs;
-
-    if (idleTime >= PAGE1_DURATION_MS) {
-      unsigned long cyclePos = (idleTime - PAGE1_DURATION_MS) % (PAGE2_DURATION_MS + PAGE1_DURATION_MS);
-      int desiredPage = cyclePos < PAGE2_DURATION_MS ? 2 : 1;
-
-      if (desiredPage != activeDisplayPage) {
-        activeDisplayPage = desiredPage;
-        screenNeedsUpdate = true;
-      }
-    }
-  }
-
-  if (oledIsOn && activeDisplayPage == 1 && now - lastTickerMillis >= 80UL) {
-    lastTickerMillis = now;
-
-    ticker1X -= 2;
-    if (ticker1X < -((int)currentTicker1Text.length() * 6)) {
-      ticker1X = 128;
-    }
-
-    ticker2X -= 2;
-    if (ticker2X < -((int)currentTicker2Text.length() * 6)) {
-      ticker2X = 128;
-    }
-
-    screenNeedsUpdate = true;
-  }
-
   int currentCLK = digitalRead(ENC_CLK);
-
   if (currentCLK != lastCLKState && currentCLK == LOW) {
-    wakeUpOledAndResetPage();
-
+    wakeUpOled();
     if (currentState == STATE_SELECT_SOC) {
-      if (digitalRead(ENC_DT) != currentCLK) {
-        startSoC++;
-      } else {
-        startSoC--;
-      }
-
+      startSoC += (digitalRead(ENC_DT) != currentCLK) ? 1 : -1;
       startSoC = constrain(startSoC, 5, 79);
       screenNeedsUpdate = true;
     }
   }
-
   lastCLKState = currentCLK;
 
   bool btnReading = digitalRead(ENC_SW) == LOW;
-
   if (btnReading && !btnIsDown) {
     if (now - btnDownTime > 80UL) {
       btnIsDown = true;
       longPressHandled = false;
       btnDownTime = now;
-      wakeUpOledAndResetPage();
+      wakeUpOled();
     }
   } else if (btnReading && btnIsDown) {
     if (!longPressHandled && now - btnDownTime >= LONG_PRESS_MS) {
       longPressHandled = true;
-      toggleDpmOff15Min();
+      if (bleConnected && bleAuthenticated) toggleDpmOff15Min();
     }
   } else if (!btnReading && btnIsDown) {
     btnIsDown = false;
-
     if (!longPressHandled && now - btnDownTime >= 80UL) {
       if (currentState == STATE_SELECT_SOC) {
-        float netKwh = ((TARGET_SOC - startSoC) / 100.0f) * NET_BATTERY_KWH;
-
-        targetGrossKwh = netKwh * AC_LOSS_FACTOR;
-        fallbackDurationSec = (unsigned long)((netKwh / FALLBACK_POWER_KW) * 3600.0f);
-
-        elapsedChargingSec = 0;
-        deliveredKwh = 0.0f;
-        sessionStartKwh = -1.0f;
-        hasLiveEnergyData = false;
-        lastTickMillis = now;
-        currentState = STATE_WAITING_START;
-        screenNeedsUpdate = true;
+        startSession(startSoC);
       } else if (currentState == STATE_COMPLETED) {
         currentState = STATE_SELECT_SOC;
+        nativeStopPending = false;
+        nativeStopAck = false;
         screenNeedsUpdate = true;
-      } else if (currentState == STATE_WAITING_START || currentState == STATE_CHARGING) {
-        if (dpmTemporarilyOff) {
-          dpmTemporarilyOff = false;
-          sendBLECommand("$CMD,DPM,1");
-          delay(200);
-        }
-
-        sendBLECommand("$CMD,CHARGE,0");
-        currentState = STATE_COMPLETED;
-        screenNeedsUpdate = true;
+      } else {
+        requestStop();
       }
     }
   }
 
   if (dpmTemporarilyOff && getDpmRemainingSec() == 0) {
-    Serial.println("DPM OFF timer expired; restoring DPM ON.");
     dpmTemporarilyOff = false;
-    sendBLECommand("$CMD,DPM,1");
-    wakeUpOledAndResetPage();
+    if (bleConnected && bleAuthenticated) setDpmEnabled(true);
+    lastReply = "Timer DPM scaduto; ripristino DPM richiesto";
     screenNeedsUpdate = true;
   }
 
@@ -851,13 +812,12 @@ void loop() {
       bleConnected = false;
       bleAuthenticated = false;
       screenNeedsUpdate = true;
-      Serial.println("[BLE] Connection lost.");
+      Serial.println("[BLE] Connessione persa.");
     }
 
     if (now - lastReconnectAttempt > 7000UL) {
       lastReconnectAttempt = now;
       connectToWallbox();
-      screenNeedsUpdate = true;
     }
   }
 
@@ -869,11 +829,6 @@ void loop() {
   if (now - lastTickMillis >= 1000UL) {
     lastTickMillis += 1000UL;
 
-    if (dpmTemporarilyOff) {
-      hourglassAnimFrame = !hourglassAnimFrame;
-      if (oledIsOn) screenNeedsUpdate = true;
-    }
-
     if (currentState == STATE_CHARGING) {
       elapsedChargingSec++;
 
@@ -881,34 +836,16 @@ void loop() {
         deliveredKwh = ((float)elapsedChargingSec / (float)fallbackDurationSec) * targetGrossKwh;
       }
 
-      if (elapsedChargingSec % 5 == 0 && oledIsOn) {
-        screenNeedsUpdate = true;
-      }
-
       bool kwhReached = hasLiveEnergyData && deliveredKwh >= targetGrossKwh;
       bool timeReached = !hasLiveEnergyData && fallbackDurationSec > 0 && elapsedChargingSec >= fallbackDurationSec;
 
-      if (kwhReached || timeReached) {
-        Serial.println("Target reached; sending STOP.");
-
-        if (dpmTemporarilyOff) {
-          dpmTemporarilyOff = false;
-          sendBLECommand("$CMD,DPM,1");
-          delay(200);
-        }
-
-        sendBLECommand("$CMD,CHARGE,0");
-        delay(500);
-        sendBLECommand("$CMD,CHARGE,0");
-
-        currentState = STATE_COMPLETED;
-        wakeUpOledAndResetPage();
-        screenNeedsUpdate = true;
+      if ((kwhReached || timeReached) && !nativeStopPending) {
+        Serial.println("[CHARGE] Soglia stimata raggiunta; invio richiesta STOP.");
+        requestStop();
+        wakeUpOled();
       }
     }
   }
 
-  if (screenNeedsUpdate) {
-    updateDisplay();
-  }
+  if (screenNeedsUpdate) updateDisplay();
 }
